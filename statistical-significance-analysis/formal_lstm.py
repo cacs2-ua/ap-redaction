@@ -621,6 +621,9 @@ def init_model_weights(
         else:
             raise ValueError(f"Unknown init scheme: {scheme}")
 
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+
     def _init_vector(p: torch.Tensor) -> None:
         # peephole vectors: keep them small
         if scheme in ("small_normal", "xavier_normal", "kaiming_normal"):
@@ -1302,3 +1305,235 @@ def run_language_suite(
     if pd is not None:
         return pd.DataFrame(all_records), pd.DataFrame(summary)
     return all_records, summary
+
+def _to_dataframe(run_records: Any):
+    if pd is not None and isinstance(run_records, pd.DataFrame):
+        return run_records.copy()
+    if pd is not None and isinstance(run_records, list):
+        return pd.DataFrame(run_records)
+    # pandas not available -> keep as list[dict]
+    return run_records
+
+
+def _as_numpy(x) -> np.ndarray:
+    return np.asarray(list(x), dtype=float)
+
+
+def _probability_of_superiority(a: np.ndarray, b: np.ndarray) -> float:
+    # P(a>b) + 0.5 P(a==b)
+    # Uses all pairwise comparisons (small n: seeds)
+    if a.size == 0 or b.size == 0:
+        return float("nan")
+    aa = a.reshape(-1, 1)
+    bb = b.reshape(1, -1)
+    win = (aa > bb).mean()
+    tie = (aa == bb).mean()
+    return float(win + 0.5 * tie)
+
+
+def _bootstrap_ci(
+    rng: np.random.Generator,
+    a: np.ndarray,
+    b: np.ndarray,
+    stat_fn,
+    n_iter: int,
+    alpha: float,
+) -> Tuple[float, float, float]:
+    # returns: (stat_obs, ci_low, ci_high)
+    stat_obs = float(stat_fn(a, b))
+    if a.size == 0 or b.size == 0:
+        return stat_obs, float("nan"), float("nan")
+
+    boots = np.empty(n_iter, dtype=float)
+    for i in range(n_iter):
+        sa = a[rng.integers(0, a.size, size=a.size)]
+        sb = b[rng.integers(0, b.size, size=b.size)]
+        boots[i] = float(stat_fn(sa, sb))
+
+    lo = float(np.quantile(boots, alpha / 2.0))
+    hi = float(np.quantile(boots, 1.0 - alpha / 2.0))
+    return stat_obs, lo, hi
+
+
+def _permutation_pvalue(
+    rng: np.random.Generator,
+    a: np.ndarray,
+    b: np.ndarray,
+    stat_fn,
+    n_perm: int,
+) -> float:
+    # two-sided permutation p-value
+    if a.size == 0 or b.size == 0:
+        return float("nan")
+    obs = float(stat_fn(a, b))
+    pooled = np.concatenate([a, b], axis=0)
+    n_a = a.size
+
+    more_extreme = 0
+    for _ in range(n_perm):
+        idx = rng.permutation(pooled.size)
+        pa = pooled[idx[:n_a]]
+        pb = pooled[idx[n_a:]]
+        val = float(stat_fn(pa, pb))
+        if abs(val) >= abs(obs):
+            more_extreme += 1
+
+    return float((more_extreme + 1) / (n_perm + 1))
+
+
+def significance_suite_by_language(
+    run_records: Any,
+    *,
+    metric: str = "success_n",
+    higher_is_better: bool = True,
+    group_field: str = "use_peepholes",
+    group_a_value: Any = True,
+    group_b_value: Any = False,
+    methods: Tuple[str, ...] = ("aso", "bootstrap", "permutation"),
+    confidence_level: float = 0.95,
+    num_bootstrap_iterations: int = 1000,   # used for ASO CI + mean-diff CI
+    dt: float = 0.005,                      # kept for API compatibility (not required here)
+    num_samples: int = 5000,                # used for permutation n_perm
+    num_jobs: int = 1,                      # kept for API compatibility (single-process here)
+    seed: int = 0,
+    verbose: int = 0,
+) -> Any:
+    """
+    Per-language comparison of group A vs group B.
+
+    Implemented stats (small-sample friendly):
+      - 'aso': Probability of superiority (PS) and its scaled effect: ASO = 2*PS - 1, in [-1,1]
+      - 'bootstrap': bootstrap CI for mean difference (A-B)
+      - 'permutation': permutation p-value for mean difference (A-B)
+
+    Returns:
+      pandas.DataFrame if pandas available, else list[dict]
+    """
+    alpha = 1.0 - float(confidence_level)
+    rng = np.random.default_rng(int(seed))
+
+    df = _to_dataframe(run_records)
+
+    # If pandas not available, operate on list[dict]
+    if pd is None:
+        # group by lang
+        by_lang: Dict[str, List[Dict[str, Any]]] = {}
+        for r in df:
+            by_lang.setdefault(str(r.get("lang")), []).append(r)
+
+        out_rows: List[Dict[str, Any]] = []
+        for lang, rows in by_lang.items():
+            a_vals = _as_numpy([r.get(metric) for r in rows if r.get(group_field) == group_a_value])
+            b_vals = _as_numpy([r.get(metric) for r in rows if r.get(group_field) == group_b_value])
+            out_rows.append(_significance_one_lang(
+                rng, lang, metric, a_vals, b_vals, higher_is_better, methods,
+                alpha, num_bootstrap_iterations, num_samples, verbose
+            ))
+        return out_rows
+
+    # pandas path
+    assert pd is not None
+    out_rows: List[Dict[str, Any]] = []
+    for lang in sorted(df["lang"].unique().tolist()):
+        sub = df[df["lang"] == lang]
+        a_vals = _as_numpy(sub[sub[group_field] == group_a_value][metric].tolist())
+        b_vals = _as_numpy(sub[sub[group_field] == group_b_value][metric].tolist())
+        out_rows.append(_significance_one_lang(
+            rng, str(lang), metric, a_vals, b_vals, higher_is_better, methods,
+            alpha, num_bootstrap_iterations, num_samples, verbose
+        ))
+
+    return pd.DataFrame(out_rows)
+
+
+def _significance_one_lang(
+    rng: np.random.Generator,
+    lang: str,
+    metric: str,
+    a_vals: np.ndarray,
+    b_vals: np.ndarray,
+    higher_is_better: bool,
+    methods: Tuple[str, ...],
+    alpha: float,
+    n_boot: int,
+    n_perm: int,
+    verbose: int,
+) -> Dict[str, Any]:
+    def mean_diff(a, b) -> float:
+        return float(np.mean(a) - np.mean(b))
+
+    mean_a = float(np.mean(a_vals)) if a_vals.size else float("nan")
+    mean_b = float(np.mean(b_vals)) if b_vals.size else float("nan")
+    diff = float(mean_a - mean_b) if (a_vals.size and b_vals.size) else float("nan")
+
+    if not higher_is_better and np.isfinite(diff):
+        # If lower is better, invert interpretation (but keep diff = mean(A)-mean(B))
+        better = "A" if diff < 0 else ("B" if diff > 0 else "tie")
+    else:
+        better = "A" if diff > 0 else ("B" if diff < 0 else "tie")
+
+    row: Dict[str, Any] = {
+        "lang": lang,
+        "metric": metric,
+        "n_A": int(a_vals.size),
+        "n_B": int(b_vals.size),
+        "mean_A": mean_a,
+        "mean_B": mean_b,
+        "mean_diff_A_minus_B": diff,
+        "better": better,
+    }
+
+    if verbose >= 1:
+        print(f"[sig] lang={lang} metric={metric} nA={a_vals.size} nB={b_vals.size} meanA={mean_a:.3g} meanB={mean_b:.3g} diff={diff:.3g}")
+
+    for m in methods:
+        m = str(m).lower().strip()
+
+        if m == "aso":
+            ps = _probability_of_superiority(a_vals, b_vals)
+            aso = float(2.0 * ps - 1.0) if np.isfinite(ps) else float("nan")
+
+            # bootstrap CI for ASO
+            def aso_stat(a, b) -> float:
+                p = _probability_of_superiority(a, b)
+                return float(2.0 * p - 1.0)
+
+            aso_obs, aso_lo, aso_hi = _bootstrap_ci(rng, a_vals, b_vals, aso_stat, n_iter=n_boot, alpha=alpha)
+            row.update({
+                "aso_effect": float(aso_obs),
+                "aso_ci_low": float(aso_lo),
+                "aso_ci_high": float(aso_hi),
+            })
+
+        elif m == "bootstrap":
+            diff_obs, diff_lo, diff_hi = _bootstrap_ci(rng, a_vals, b_vals, mean_diff, n_iter=n_boot, alpha=alpha)
+            # “bootstrap p-value” (two-sided, sign test on bootstrapped diffs)
+            # p ≈ 2*min(P(diff<=0), P(diff>=0))
+            if a_vals.size and b_vals.size:
+                boots = np.empty(n_boot, dtype=float)
+                for i in range(n_boot):
+                    sa = a_vals[rng.integers(0, a_vals.size, size=a_vals.size)]
+                    sb = b_vals[rng.integers(0, b_vals.size, size=b_vals.size)]
+                    boots[i] = float(np.mean(sa) - np.mean(sb))
+                p_two = 2.0 * min(float((boots <= 0).mean()), float((boots >= 0).mean()))
+                p_two = min(1.0, p_two)
+            else:
+                p_two = float("nan")
+
+            row.update({
+                "bootstrap_mean_diff": float(diff_obs),
+                "bootstrap_ci_low": float(diff_lo),
+                "bootstrap_ci_high": float(diff_hi),
+                "bootstrap_pvalue_two_sided": float(p_two),
+            })
+
+        elif m == "permutation":
+            p = _permutation_pvalue(rng, a_vals, b_vals, mean_diff, n_perm=n_perm)
+            row.update({
+                "permutation_pvalue_two_sided": float(p),
+            })
+
+        else:
+            raise ValueError(f"Unknown method {m!r}. Supported: 'aso', 'bootstrap', 'permutation'")
+
+    return row
