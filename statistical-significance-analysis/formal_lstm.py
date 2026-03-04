@@ -179,11 +179,11 @@ def fill_soft_target_anbncn(seq: str, j: int, soft_target: torch.Tensor, token_i
         soft_target[token_index["a"]] = 0.5
         soft_target[token_index["b"]] = 0.5
     elif seq[j] == "b":
-        soft_target[token_index["b"]] = 0.5
-        soft_target[token_index["c"]] = 0.5
+        # deterministic once b's start (boundary b->c is predictable from prefix counting)
+        soft_target[token_index[seq[j + 1]]] = 1.0
     elif seq[j] == "c":
-        soft_target[token_index["c"]] = 0.5
-        soft_target[token_index["$"]] = 0.5
+        # deterministic once c's start (boundary c->$ is predictable from prefix counting)
+        soft_target[token_index[seq[j + 1]]] = 1.0
     elif seq[j] == "$":
         soft_target[token_index["$"]] = 1.0
 
@@ -204,30 +204,27 @@ def get_language_anbncn() -> LanguageSpec:
         generate_sequence=generate_sequence_anbncn,
     )
 
-
-# --- a^n b^m B^m A^n ---
 def fill_soft_target_anbmBmAn(seq: str, j: int, soft_target: torch.Tensor, token_index: Dict[str, int]) -> None:
     """
-    Plausible-next-symbol sets are defined by the *language* (not the specific string):
-      ^ -> {a, b, $}
-      a -> {a, b, A}
-      b -> {b, B}
-      B -> {B, A}
-      A -> {A, $}
-      $ -> {$}
+    Hybrid evaluation:
+      - '^', 'a', 'b' use grammar-based plausible next symbols (non-deterministic)
+      - 'B' and 'A' are deterministic because once their phases begin,
+        the boundaries (B->A and A->$) are predictable from prefix counting.
     """
     soft_target.zero_()
     s = seq[j]
+
+    # IMPORTANT: make B-phase and A-phase deterministic (counting boundaries)
+    if s == "B" or s == "A":
+        soft_target[token_index[seq[j + 1]]] = 1.0
+        return
+
     if s == "^":
         opts = ["a", "b", "$"]
     elif s == "a":
         opts = ["a", "b", "A"]
     elif s == "b":
         opts = ["b", "B"]
-    elif s == "B":
-        opts = ["B", "A"]
-    elif s == "A":
-        opts = ["A", "$"]
     elif s == "$":
         opts = ["$"]
     else:
